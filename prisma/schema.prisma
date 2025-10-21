@@ -1,0 +1,251 @@
+// LeafLedger V3 - Comprehensive Schema
+// Store-count subscription model with allowlist enforcement
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===== Organizations & Users =====
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Subscription
+  planId    String   @default("lite")
+  addons    String[] @default([])
+
+  // Relations
+  users            User[]
+  allowedStores    OrgStoreAllowlist[]
+  storeSwaps       StoreSwap[]
+  alertRules       AlertRule[]
+  alertInbox       AlertInboxItem[]
+
+  @@map("organizations")
+}
+
+model User {
+  id             String       @id @default(cuid())
+  email          String       @unique
+  name           String?
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  role           String       @default("member") // admin, member
+  createdAt      DateTime     @default(now())
+
+  @@map("users")
+}
+
+// ===== Store Allowlist =====
+
+model OrgStoreAllowlist {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  storeId        String
+  store          MasterStore  @relation(fields: [storeId], references: [id])
+  addedAt        DateTime     @default(now())
+
+  @@unique([organizationId, storeId])
+  @@map("org_store_allowlist")
+}
+
+model StoreSwap {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  fromStoreId    String
+  toStoreId      String
+  requestedAt    DateTime     @default(now())
+  activatesAt    DateTime
+  status         String       @default("pending") // pending, active, cancelled
+  month          String       // YYYY-MM for quota tracking
+
+  @@map("store_swaps")
+}
+
+// ===== Master Data =====
+
+model MasterStore {
+  id      String  @id @default(cuid())
+  name    String
+  chain   String?
+  city    String
+  address String
+  lat     Float?
+  lng     Float?
+
+  // Relations
+  allowlists          OrgStoreAllowlist[]
+  menuObservations    MenuObservation[]
+  dailyVariantStore   DailyVariantStore[]
+
+  @@index([city])
+  @@map("master_stores")
+}
+
+model MasterProduct {
+  id       String            @id @default(cuid())
+  brand    String
+  name     String
+  category String
+  variants ProductVariant[]
+
+  @@index([brand])
+  @@index([category])
+  @@map("master_products")
+}
+
+model ProductVariant {
+  id        String        @id @default(cuid())
+  productId String
+  product   MasterProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
+  size      String
+  thc       String?
+  cbd       String?
+
+  // Relations
+  menuObservations  MenuObservation[]
+  dailyVariantStore DailyVariantStore[]
+  dailyVariantMarket DailyVariantMarket[]
+
+  @@index([productId])
+  @@map("product_variants")
+}
+
+// ===== Raw Observations =====
+
+model MenuObservation {
+  id          String         @id @default(cuid())
+  storeId     String
+  store       MasterStore    @relation(fields: [storeId], references: [id])
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id])
+  observedAt  DateTime
+  price       Float
+  inStock     Boolean
+  onSale      Boolean
+  salePrice   Float?
+
+  menuMappings MenuMapping[]
+
+  @@index([storeId, observedAt])
+  @@index([variantId, observedAt])
+  @@map("menu_observations")
+}
+
+model MenuMapping {
+  id              String          @id @default(cuid())
+  observationId   String
+  observation     MenuObservation @relation(fields: [observationId], references: [id], onDelete: Cascade)
+  rawSku          String
+  rawName         String
+  rawBrand        String?
+  confidence      Float
+
+  @@map("menu_mappings")
+}
+
+// ===== Materialized Snapshots =====
+
+// Daily snapshot of variant pricing at each store
+model DailyVariantStore {
+  id          String         @id @default(cuid())
+  date        DateTime       @db.Date
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id])
+  storeId     String
+  store       MasterStore    @relation(fields: [storeId], references: [id])
+  
+  // Aggregated metrics
+  price       Float
+  inStock     Boolean
+  onSale      Boolean
+  
+  // Computed fields
+  pricePerGram Float?
+
+  @@unique([date, variantId, storeId])
+  @@index([variantId, date])
+  @@index([storeId, date])
+  @@map("daily_variant_store")
+}
+
+// Daily market-level snapshot for each variant
+model DailyVariantMarket {
+  id          String         @id @default(cuid())
+  date        DateTime       @db.Date
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id])
+  
+  // Market metrics
+  minPrice    Float
+  medianPrice Float
+  p90Price    Float
+  coverage    Int            // number of stores with this variant
+  
+  // Price changes
+  delta7d     Float?
+  delta30d    Float?
+  
+  // Rank and competitiveness
+  rankInMarket      Int?
+  gapToMedian       Float?
+  promoRate         Float?   // % of stores with sale
+
+  @@unique([date, variantId])
+  @@index([variantId, date])
+  @@map("daily_variant_market")
+}
+
+// ===== Alerts =====
+
+model AlertRule {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  type           String       // undercut, new_sku, back_in_stock, median_move, rank_loss
+  config         Json
+  enabled        Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+
+  inboxItems AlertInboxItem[]
+
+  @@map("alert_rules")
+}
+
+model AlertInboxItem {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ruleId         String
+  rule           AlertRule    @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  type           String
+  message        String
+  timestamp      DateTime     @default(now())
+  status         String       @default("unread") // unread, read, snoozed, muted
+  variantId      String?
+  storeId        String?
+
+  @@index([organizationId, status])
+  @@map("alert_inbox")
+}
+
+// ===== Example RLS View (SQL) =====
+// CREATE OR REPLACE VIEW org_variant_store_prices AS
+// SELECT
+//   dvs.*
+// FROM daily_variant_store dvs
+// INNER JOIN org_store_allowlist osal
+//   ON dvs.storeId = osal.storeId
+// WHERE osal.organizationId = current_setting('app.current_org_id')::text;
+

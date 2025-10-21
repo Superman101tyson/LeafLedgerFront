@@ -1,0 +1,309 @@
+// LeafLedger V3 - Comprehensive Schema
+// Store-count subscription model with allowlist enforcement
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===== Core Store & Product Data =====
+
+model Store {
+  id            String   @id @default(cuid())
+  name          String
+  chain         String?
+  city          String
+  province      String   @default("BC")
+  lat           Float?
+  lng           Float?
+  sourceVendor  String?  // dutchie, jane, etc
+  status        String   @default("active") // active, inactive, closed
+  lastScrapeAt  DateTime?
+
+  // Relations
+  allowlists        OrgStoreAllowlist[]
+  menuObservations  MenuObservation[]
+  dailyVariantStore DailyVariantStore[]
+  swapsFrom         StoreSwap[]         @relation("FromStore")
+  swapsTo           StoreSwap[]         @relation("ToStore")
+
+  @@index([city])
+  @@index([province])
+  @@index([status])
+  @@map("stores")
+}
+
+model Brand {
+  id             String          @id @default(cuid())
+  name           String          @unique
+  masterProducts MasterProduct[]
+
+  @@map("brands")
+}
+
+model MasterProduct {
+  id       String  @id @default(cuid())
+  brandId  String
+  brand    Brand   @relation(fields: [brandId], references: [id])
+  name     String
+  category String  // Flower, Pre-Rolls, Edibles, Concentrates, etc
+  form     String? // sativa, indica, hybrid, etc
+  thcMin   Float?
+  thcMax   Float?
+  cbdMin   Float?
+  cbdMax   Float?
+
+  variants ProductVariant[]
+
+  @@index([brandId])
+  @@index([category])
+  @@map("master_products")
+}
+
+model ProductVariant {
+  id              String        @id @default(cuid())
+  masterProductId String
+  masterProduct   MasterProduct @relation(fields: [masterProductId], references: [id])
+  sizeValue       Float
+  sizeUnit        String        // g, ml, pk (pack)
+  unitCount       Int?          // for multi-packs
+  normalizedQtyG  Float         // everything normalized to grams
+  upc             String?
+
+  // Relations
+  menuMappings       MenuMapping[]
+  dailyVariantStore  DailyVariantStore[]
+  dailyVariantMarket DailyVariantMarket[]
+
+  @@index([masterProductId])
+  @@map("product_variants")
+}
+
+// ===== Raw Observation Data =====
+
+model MenuObservation {
+  id           String   @id @default(cuid())
+  storeId      String
+  store        Store    @relation(fields: [storeId], references: [id])
+  observedAt   DateTime
+  rawTitle     String
+  rawSizeText  String?
+  rawPrice     Float
+  listPrice    Float
+  isSale       Boolean  @default(false)
+  inStock      Boolean  @default(true)
+  sourceUrl    String?
+
+  menuMappings MenuMapping[]
+
+  @@index([storeId, observedAt])
+  @@map("menu_observations")
+}
+
+model MenuMapping {
+  id               String          @id @default(cuid())
+  observationId    String
+  observation      MenuObservation @relation(fields: [observationId], references: [id], onDelete: Cascade)
+  productVariantId String
+  productVariant   ProductVariant  @relation(fields: [productVariantId], references: [id])
+  confidence       Float           // 0.0 - 1.0
+  resolver         String          // auto, manual, ml
+
+  @@index([productVariantId])
+  @@map("menu_mappings")
+}
+
+// ===== Materialized Snapshots =====
+
+model DailyVariantStore {
+  id            String         @id @default(cuid())
+  date          DateTime       @db.Date
+  storeId       String
+  store         Store          @relation(fields: [storeId], references: [id])
+  variantId     String
+  variant       ProductVariant @relation(fields: [variantId], references: [id])
+  price         Float
+  inStock       Boolean
+  isSale        Boolean
+  pricePerG     Float?
+  rankInMarket  Int?
+  gapToMedian   Float?
+
+  @@unique([date, storeId, variantId])
+  @@index([variantId, date])
+  @@index([storeId, date])
+  @@map("daily_variant_store")
+}
+
+model DailyVariantMarket {
+  id            String         @id @default(cuid())
+  date          DateTime       @db.Date
+  variantId     String
+  variant       ProductVariant @relation(fields: [variantId], references: [id])
+  minPrice      Float
+  medianPrice   Float
+  p90Price      Float
+  storesInStock Int
+  storesTotal   Int
+  promoRate     Float?
+
+  @@unique([date, variantId])
+  @@index([variantId, date])
+  @@map("daily_variant_market")
+}
+
+// ===== Organizations & Auth =====
+
+model Org {
+  id        String   @id @default(cuid())
+  name      String
+  type      String   @default("retailer") // retailer, chain, lp, consultant
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  members       OrgMember[]
+  subscription  Subscription?
+  entitlements  Entitlement[]
+  allowlist     OrgStoreAllowlist[]
+  swaps         StoreSwap[]
+  alertRules    AlertRule[]
+  alertInbox    AlertInboxItem[]
+  competitorSets CompetitorSet[]
+
+  @@map("orgs")
+}
+
+model User {
+  id        String      @id @default(cuid())
+  email     String      @unique
+  name      String?
+  createdAt DateTime    @default(now())
+  memberships OrgMember[]
+
+  @@map("users")
+}
+
+model OrgMember {
+  id     String @id @default(cuid())
+  orgId  String
+  org    Org    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   String @default("analyst") // owner, admin, manager, analyst, billing
+
+  @@unique([orgId, userId])
+  @@map("org_members")
+}
+
+// ===== Subscription & Entitlements =====
+
+model Subscription {
+  id       String   @id @default(cuid())
+  orgId    String   @unique
+  org      Org      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  planCode String   // lite, starter, pro, provincial
+  status   String   @default("active") // active, past_due, canceled
+  renewsAt DateTime
+  
+  @@map("subscriptions")
+}
+
+model Entitlement {
+  id    String @id @default(cuid())
+  orgId String
+  org   Org    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  key   String // maxTrackedStores, seatsIncluded, maxAlertRules, swapQuotaMonthly, apiAccess
+  value String // store as string, parse as needed
+
+  @@unique([orgId, key])
+  @@map("entitlements")
+}
+
+model OrgStoreAllowlist {
+  id       String    @id @default(cuid())
+  orgId    String
+  org      Org       @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  storeId  String
+  store    Store     @relation(fields: [storeId], references: [id])
+  lockedAt DateTime  @default(now())
+
+  @@unique([orgId, storeId])
+  @@index([orgId])
+  @@map("org_store_allowlist")
+}
+
+model StoreSwap {
+  id                 String   @id @default(cuid())
+  orgId              String
+  org                Org      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  fromStoreId        String
+  fromStore          Store    @relation("FromStore", fields: [fromStoreId], references: [id])
+  toStoreId          String
+  toStore            Store    @relation("ToStore", fields: [toStoreId], references: [id])
+  requestedAt        DateTime @default(now())
+  activatesAt        DateTime
+  reason             String?
+  countsAgainstQuota Boolean  @default(true)
+  status             String   @default("pending") // pending, active, cancelled
+
+  @@index([orgId])
+  @@map("store_swaps")
+}
+
+// ===== Competitor Sets =====
+
+model CompetitorSet {
+  id          String   @id @default(cuid())
+  orgId       String
+  org         Org      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  storeIds    String[] // Array of store IDs
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([orgId])
+  @@map("competitor_sets")
+}
+
+// ===== Alerts =====
+
+model AlertRule {
+  id      String  @id @default(cuid())
+  orgId   String
+  org     Org     @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  name    String
+  type    String  // undercut, new_sku, back_in_stock, median_move, rank_loss
+  config  Json
+  enabled Boolean @default(true)
+  createdAt DateTime @default(now())
+
+  inboxItems AlertInboxItem[]
+
+  @@index([orgId])
+  @@map("alert_rules")
+}
+
+model AlertInboxItem {
+  id        String    @id @default(cuid())
+  orgId     String
+  org       Org       @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  ruleId    String
+  rule      AlertRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  type      String
+  message   String
+  timestamp DateTime  @default(now())
+  status    String    @default("unread") // unread, read, snoozed, muted
+  variantId String?
+  storeId   String?
+
+  @@index([orgId, status])
+  @@map("alert_inbox")
+}
+
+
